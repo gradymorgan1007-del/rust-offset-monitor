@@ -32,8 +32,28 @@ jobs:
           import urllib.request
           import urllib.error
 
-          api = "https://offsets.yxllow.dev/api/rust/latest"
+          def get_value(obj, key):
+              if isinstance(obj, dict):
+                  return obj.get(key)
 
+              if isinstance(obj, list):
+                  for item in obj:
+                      if isinstance(item, dict):
+                          if key in item:
+                              return item[key]
+
+                          name = (
+                              item.get("name")
+                              or item.get("key")
+                              or item.get("filename")
+                          )
+
+                          if name == key:
+                              return item
+
+              return None
+
+          api = "https://offsets.yxllow.dev/api/rust/latest"
           req = urllib.request.Request(
               api,
               headers={"User-Agent": "RustOffsetMonitor"}
@@ -43,28 +63,36 @@ jobs:
               with urllib.request.urlopen(req, timeout=30) as response:
                   data = json.load(response)
           except Exception as e:
-              raise RuntimeError(f"Could not fetch Rust offsets: {e}")
+              raise RuntimeError(f"Could not fetch website data: {e}")
 
-          if not isinstance(data, dict):
-              raise RuntimeError("Unexpected API response format")
+          if not isinstance(data, (dict, list)):
+              raise RuntimeError("Unexpected website response")
 
-          files = data.get("files") or {}
-          offsets = files.get("offsets") or {}
-          steam = data.get("steam") or {}
+          files = get_value(data, "files")
+          offsets = get_value(files, "offsets")
+          steam = get_value(data, "steam")
+
+          offset_hash = get_value(offsets, "sha256")
+          steam_build = get_value(steam, "buildid")
+          status = get_value(data, "status")
+
+          if not offset_hash:
+              print("Website response:")
+              print(json.dumps(data, indent=2))
+              raise RuntimeError(
+                  "Could not find the offsets SHA-256 hash. "
+                  "The website response format may have changed."
+              )
 
           current = {
-              "offsets_sha256": offsets.get("sha256"),
-              "status": data.get("status"),
-              "steam_buildid": steam.get("buildid")
+              "offsets_sha256": offset_hash,
+              "status": status,
+              "steam_buildid": steam_build
           }
-
-          if not current["offsets_sha256"]:
-              print("API response:", json.dumps(data, indent=2))
-              raise RuntimeError("Rust offsets hash not found in API response")
 
           if not os.environ.get("DISCORD_WEBHOOK"):
               raise RuntimeError(
-                  "DISCORD_WEBHOOK secret is missing from GitHub settings"
+                  "Missing DISCORD_WEBHOOK secret in GitHub settings."
               )
 
           path = "rust-state.json"
@@ -79,57 +107,59 @@ jobs:
 
           if previous is None:
               print("First run: saving baseline. No alert sent.")
-          elif current != previous:
-              changes = []
 
+          elif current != previous:
               labels = [
                   ("offsets_sha256", "Rust offsets hash"),
                   ("status", "Offset status"),
                   ("steam_buildid", "Steam build ID")
               ]
 
+              changes = []
+
               for key, label in labels:
                   if current.get(key) != previous.get(key):
                       changes.append(
                           f"**{label}:** "
-                          f"`{previous.get(key)}` → `{current.get(key)}`"
+                          f"`{previous.get(key)}` -> `{current.get(key)}`"
                       )
 
-              message = (
-                  "🚨 **Rust offsets update detected!**\n"
-                  + "\n".join(changes)
-                  + "\nhttps://offsets.yxllow.dev/"
-              )
-
-              payload = json.dumps({
-                  "content": message
-              }).encode("utf-8")
-
-              discord_req = urllib.request.Request(
-                  os.environ["DISCORD_WEBHOOK"],
-                  data=payload,
-                  headers={"Content-Type": "application/json"},
-                  method="POST"
-              )
-
-              try:
-                  with urllib.request.urlopen(
-                      discord_req, timeout=30
-                  ) as response:
-                      print("Discord response:", response.status)
-              except urllib.error.HTTPError as e:
-                  raise RuntimeError(
-                      f"Discord webhook returned HTTP {e.code}"
+              if changes:
+                  message = (
+                      "Rust offsets update detected!\n"
+                      + "\n".join(changes)
+                      + "\nhttps://offsets.yxllow.dev/"
                   )
 
-              print("Discord update notification sent.")
+                  payload = json.dumps({
+                      "content": message
+                  }).encode("utf-8")
+
+                  discord_req = urllib.request.Request(
+                      os.environ["DISCORD_WEBHOOK"],
+                      data=payload,
+                      headers={"Content-Type": "application/json"},
+                      method="POST"
+                  )
+
+                  try:
+                      with urllib.request.urlopen(
+                          discord_req, timeout=30
+                      ) as response:
+                          print("Discord response:", response.status)
+                  except urllib.error.HTTPError as e:
+                      raise RuntimeError(
+                          f"Discord webhook failed with HTTP {e.code}"
+                      )
+
+                  print("Discord notification sent.")
           else:
               print("No changes detected.")
 
           with open(path, "w") as f:
               json.dump(current, f)
 
-          print("Current Rust state saved.")
+          print("Current state saved.")
           PY
 
       - name: Save current Rust version
