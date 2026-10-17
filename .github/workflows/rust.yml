@@ -12,6 +12,7 @@ permissions:
 jobs:
   check-rust:
     runs-on: ubuntu-latest
+
     steps:
       - name: Restore previous Rust version
         uses: actions/cache/restore@v4
@@ -29,78 +30,106 @@ jobs:
           import json
           import os
           import urllib.request
+          import urllib.error
 
           api = "https://offsets.yxllow.dev/api/rust/latest"
+
           req = urllib.request.Request(
               api,
               headers={"User-Agent": "RustOffsetMonitor"}
           )
 
-          with urllib.request.urlopen(req, timeout=20) as r:
-              data = json.load(r)
+          try:
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  data = json.load(response)
+          except Exception as e:
+              raise RuntimeError(f"Could not fetch Rust offsets: {e}")
 
           if not isinstance(data, dict):
-              raise RuntimeError("Unexpected API response")
+              raise RuntimeError("Unexpected API response format")
+
+          files = data.get("files") or {}
+          offsets = files.get("offsets") or {}
+          steam = data.get("steam") or {}
 
           current = {
-              "build": data.get("build"),
+              "offsets_sha256": offsets.get("sha256"),
               "status": data.get("status"),
-              "steam": data.get("steam")
+              "steam_buildid": steam.get("buildid")
           }
 
-          if not current["build"]:
+          if not current["offsets_sha256"]:
               print("API response:", json.dumps(data, indent=2))
-              raise RuntimeError("Rust build field not found")
+              raise RuntimeError("Rust offsets hash not found in API response")
+
+          if not os.environ.get("DISCORD_WEBHOOK"):
+              raise RuntimeError(
+                  "DISCORD_WEBHOOK secret is missing from GitHub settings"
+              )
 
           path = "rust-state.json"
           previous = None
 
           if os.path.exists(path):
-              with open(path) as f:
-                  previous = json.load(f)
+              try:
+                  with open(path, "r") as f:
+                      previous = json.load(f)
+              except (json.JSONDecodeError, OSError):
+                  previous = None
 
           if previous is None:
-              print("First run: saving baseline, no alert.")
+              print("First run: saving baseline. No alert sent.")
           elif current != previous:
               changes = []
 
-              for key, label in [
-                  ("build", "Rust build"),
+              labels = [
+                  ("offsets_sha256", "Rust offsets hash"),
                   ("status", "Offset status"),
-                  ("steam", "Steam build")
-              ]:
-                  if current[key] != previous.get(key):
+                  ("steam_buildid", "Steam build ID")
+              ]
+
+              for key, label in labels:
+                  if current.get(key) != previous.get(key):
                       changes.append(
                           f"**{label}:** "
-                          f"`{previous.get(key)}` → `{current[key]}`"
+                          f"`{previous.get(key)}` → `{current.get(key)}`"
                       )
 
               message = (
-                  "🚨 **Rust offsets changed!**\n"
+                  "🚨 **Rust offsets update detected!**\n"
                   + "\n".join(changes)
                   + "\nhttps://offsets.yxllow.dev/"
               )
 
               payload = json.dumps({
                   "content": message
-              }).encode()
+              }).encode("utf-8")
 
-              request = urllib.request.Request(
+              discord_req = urllib.request.Request(
                   os.environ["DISCORD_WEBHOOK"],
                   data=payload,
                   headers={"Content-Type": "application/json"},
                   method="POST"
               )
 
-              with urllib.request.urlopen(request, timeout=20) as r:
-                  print("Discord response:", r.status)
+              try:
+                  with urllib.request.urlopen(
+                      discord_req, timeout=30
+                  ) as response:
+                      print("Discord response:", response.status)
+              except urllib.error.HTTPError as e:
+                  raise RuntimeError(
+                      f"Discord webhook returned HTTP {e.code}"
+                  )
 
-              print("Update notification sent.")
+              print("Discord update notification sent.")
           else:
               print("No changes detected.")
 
           with open(path, "w") as f:
               json.dump(current, f)
+
+          print("Current Rust state saved.")
           PY
 
       - name: Save current Rust version
