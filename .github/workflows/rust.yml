@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Restore previous Rust version
+      - name: Restore previous state
         uses: actions/cache/restore@v4
         with:
           path: rust-state.json
@@ -32,99 +32,100 @@ jobs:
           import urllib.request
           import urllib.error
 
-          def get_value(obj, key):
+          API = "https://offsets.yxllow.dev/api/rust/latest"
+          STATE_FILE = "rust-state.json"
+
+          def walk(obj):
               if isinstance(obj, dict):
-                  return obj.get(key)
+                  yield obj
+                  for value in obj.values():
+                      yield from walk(value)
+              elif isinstance(obj, list):
+                  for value in obj:
+                      yield from walk(value)
 
-              if isinstance(obj, list):
-                  for item in obj:
-                      if isinstance(item, dict):
-                          if key in item:
-                              return item[key]
+          def get_current(data):
+              offset_hash = None
+              status = None
+              steam_build = None
 
-                          name = (
-                              item.get("name")
-                              or item.get("key")
-                              or item.get("filename")
-                          )
+              for item in walk(data):
+                  files = item.get("files")
+                  if isinstance(files, dict):
+                      offsets = files.get("offsets")
+                      if isinstance(offsets, dict):
+                          value = offsets.get("sha256")
+                          if value:
+                              offset_hash = value
 
-                          if name == key:
-                              return item
+                  if status is None and isinstance(item.get("status"), str):
+                      status = item["status"]
 
-              return None
+                  steam = item.get("steam")
+                  if isinstance(steam, dict) and steam.get("buildid"):
+                      steam_build = steam["buildid"]
 
-          api = "https://offsets.yxllow.dev/api/rust/latest"
-          req = urllib.request.Request(
-              api,
+              if not offset_hash:
+                  print("Could not locate the offsets hash.")
+                  print(json.dumps(data, indent=2)[:12000])
+                  raise RuntimeError(
+                      "Website response structure was not recognized."
+                  )
+
+              return {
+                  "offsets_sha256": offset_hash,
+                  "status": status,
+                  "steam_buildid": steam_build
+              }
+
+          request = urllib.request.Request(
+              API,
               headers={"User-Agent": "RustOffsetMonitor"}
           )
 
           try:
-              with urllib.request.urlopen(req, timeout=30) as response:
+              with urllib.request.urlopen(request, timeout=30) as response:
                   data = json.load(response)
-          except Exception as e:
-              raise RuntimeError(f"Could not fetch website data: {e}")
+          except Exception as error:
+              raise RuntimeError(f"Could not fetch website data: {error}")
 
-          if not isinstance(data, (dict, list)):
-              raise RuntimeError("Unexpected website response")
+          current = get_current(data)
+          print("Successfully read the current offsets information.")
 
-          files = get_value(data, "files")
-          offsets = get_value(files, "offsets")
-          steam = get_value(data, "steam")
-
-          offset_hash = get_value(offsets, "sha256")
-          steam_build = get_value(steam, "buildid")
-          status = get_value(data, "status")
-
-          if not offset_hash:
-              print("Website response:")
-              print(json.dumps(data, indent=2))
-              raise RuntimeError(
-                  "Could not find the offsets SHA-256 hash. "
-                  "The website response format may have changed."
-              )
-
-          current = {
-              "offsets_sha256": offset_hash,
-              "status": status,
-              "steam_buildid": steam_build
-          }
-
-          if not os.environ.get("DISCORD_WEBHOOK"):
-              raise RuntimeError(
-                  "Missing DISCORD_WEBHOOK secret in GitHub settings."
-              )
-
-          path = "rust-state.json"
           previous = None
-
-          if os.path.exists(path):
+          if os.path.exists(STATE_FILE):
               try:
-                  with open(path, "r") as f:
-                      previous = json.load(f)
-              except (json.JSONDecodeError, OSError):
-                  previous = None
+                  with open(STATE_FILE, "r") as file:
+                      previous = json.load(file)
+              except (OSError, json.JSONDecodeError):
+                  print("Previous state was unreadable; creating a new baseline.")
 
           if previous is None:
               print("First run: saving baseline. No alert sent.")
 
           elif current != previous:
-              labels = [
-                  ("offsets_sha256", "Rust offsets hash"),
-                  ("status", "Offset status"),
-                  ("steam_buildid", "Steam build ID")
-              ]
+              labels = {
+                  "offsets_sha256": "Rust offsets file changed",
+                  "status": "Offset status changed",
+                  "steam_buildid": "Steam build ID changed"
+              }
 
               changes = []
-
-              for key, label in labels:
+              for key, label in labels.items():
                   if current.get(key) != previous.get(key):
                       changes.append(
-                          f"**{label}:** "
-                          f"`{previous.get(key)}` -> `{current.get(key)}`"
+                          f"**{label}:** `{previous.get(key)}` -> "
+                          f"`{current.get(key)}`"
                       )
 
               if changes:
+                  webhook = os.environ.get("DISCORD_WEBHOOK")
+                  if not webhook:
+                      raise RuntimeError(
+                          "Add your Discord webhook under Settings > Secrets "
+                          "and variables > Actions as DISCORD_WEBHOOK."
+                      )
+
                   message = (
                       "Rust offsets update detected!\n"
                       + "\n".join(changes)
@@ -135,8 +136,8 @@ jobs:
                       "content": message
                   }).encode("utf-8")
 
-                  discord_req = urllib.request.Request(
-                      os.environ["DISCORD_WEBHOOK"],
+                  discord_request = urllib.request.Request(
+                      webhook,
                       data=payload,
                       headers={"Content-Type": "application/json"},
                       method="POST"
@@ -144,25 +145,24 @@ jobs:
 
                   try:
                       with urllib.request.urlopen(
-                          discord_req, timeout=30
+                          discord_request, timeout=30
                       ) as response:
-                          print("Discord response:", response.status)
-                  except urllib.error.HTTPError as e:
+                          print(f"Discord notification sent: HTTP {response.status}")
+                  except urllib.error.HTTPError as error:
                       raise RuntimeError(
-                          f"Discord webhook failed with HTTP {e.code}"
+                          f"Discord webhook returned HTTP {error.code}"
                       )
 
-                  print("Discord notification sent.")
           else:
               print("No changes detected.")
 
-          with open(path, "w") as f:
-              json.dump(current, f)
+          with open(STATE_FILE, "w") as file:
+              json.dump(current, file)
 
           print("Current state saved.")
           PY
 
-      - name: Save current Rust version
+      - name: Save current state
         uses: actions/cache/save@v4
         with:
           path: rust-state.json
