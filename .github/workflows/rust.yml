@@ -1,0 +1,68 @@
+
+name: Rust Offset Monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  check-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Rust offsets
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          api = "https://offsets.yxllow.dev/api/rust/latest"
+
+          req = urllib.request.Request(
+              api, headers={"User-Agent": "RustOffsetMonitor"}
+          )
+
+          with urllib.request.urlopen(req, timeout=20) as r:
+              data = json.load(r)
+
+          print(json.dumps(data, indent=2))
+
+          build = str(data.get("build", ""))
+          status = str(data.get("status", "unknown"))
+
+          if not build:
+              raise RuntimeError(
+                  "Could not find the Rust build in the API response."
+              )
+
+          state_path = "/tmp/rust_previous.json"
+
+          # Use GitHub Actions cache in a later step to persist state.
+          print(f"Rust build: {build}")
+          print(f"Offset status: {status}")
+
+          payload = json.dumps({
+              "content": (
+                  f"Rust offset monitor check complete.\n"
+                  f"Build: `{build}`\n"
+                  f"Status: `{status}`\n"
+                  "https://offsets.yxllow.dev/"
+              )
+          }).encode()
+
+          request = urllib.request.Request(
+              os.environ["DISCORD_WEBHOOK"],
+              data=payload,
+              headers={"Content-Type": "application/json"},
+              method="POST"
+          )
+
+          with urllib.request.urlopen(request, timeout=20) as r:
+              print("Discord webhook HTTP status:", r.status)
+          PY
